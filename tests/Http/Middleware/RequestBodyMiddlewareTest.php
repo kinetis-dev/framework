@@ -10,8 +10,9 @@ use Kinetis\Http\CallableRequestHandler;
 use Kinetis\Http\Form\Exception\FormStagingException;
 use Kinetis\Http\Form\FormLimits;
 use Kinetis\Http\Kernel;
-use Kinetis\Http\Middleware\MaxBodySizeMiddleware;
+use Kinetis\Http\Middleware\RequestBodyMiddleware;
 use Kinetis\Http\Routing\Router;
+use Kinetis\Runtime\RuntimeAdapterInterface;
 use Kinetis\Tests\Http\Form\FailingStream;
 use Nyholm\Psr7\Response;
 use Nyholm\Psr7\ServerRequest;
@@ -20,17 +21,20 @@ use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\ServerRequestInterface;
 
 /**
- * The byte ceiling, settled before the handler runs rather than while it
- * reads. What that buys, and what a counting stream wrapper cannot give,
- * is that every way of reading the accepted body returns the same bytes
- * — the `(string)` cast included, which such a wrapper has to answer
- * with an empty string.
+ * The one request-body contract every runtime delivers into: the byte
+ * ceiling settled before the handler runs rather than while it reads,
+ * and the form parse that follows it.
+ *
+ * What settling the ceiling first buys, and what a counting stream
+ * wrapper cannot give, is that every way of reading the accepted body
+ * returns the same bytes — the `(string)` cast included, which such a
+ * wrapper has to answer with an empty string.
  */
-final class MaxBodySizeMiddlewareTest extends TestCase
+final class RequestBodyMiddlewareTest extends TestCase
 {
-    private function middleware(int $maxBytes): MaxBodySizeMiddleware
+    private function middleware(int $maxBytes): RequestBodyMiddleware
     {
-        return new MaxBodySizeMiddleware(new FormLimits($maxBytes));
+        return new RequestBodyMiddleware(new FormLimits($maxBytes));
     }
 
     private function handler(): CallableRequestHandler
@@ -320,7 +324,7 @@ final class MaxBodySizeMiddlewareTest extends TestCase
 
     public function test_defaults_to_two_mebibytes_when_unconfigured(): void
     {
-        $middleware = new MaxBodySizeMiddleware(FormLimits::fromConfig(new Config([])));
+        $middleware = new RequestBodyMiddleware(FormLimits::fromConfig(new Config([])));
 
         $underDefault = $middleware->process(
             new ServerRequest('POST', '/', headers: ['Content-Length' => (string) FormLimits::DEFAULT_MAX_BODY_BYTES]),
@@ -333,6 +337,145 @@ final class MaxBodySizeMiddlewareTest extends TestCase
 
         self::assertSame(200, $underDefault->getStatusCode());
         self::assertSame(413, $overDefault->getStatusCode());
+    }
+
+    /**
+     * A url-encoded body reaches the handler as `getParsedBody()`, and
+     * the raw bytes are still there behind it, rewound.
+     */
+    public function test_a_url_encoded_body_is_parsed_and_left_readable(): void
+    {
+        $seen = null;
+        $raw = null;
+        $handler = new CallableRequestHandler(function (ServerRequestInterface $request) use (&$seen, &$raw) {
+            $seen = $request->getParsedBody();
+            $raw = (string) $request->getBody();
+
+            return new Response(200);
+        });
+
+        $response = $this->middleware(10_000)->process(
+            new ServerRequest(
+                'POST',
+                '/',
+                headers: ['Content-Type' => 'application/x-www-form-urlencoded'],
+                body: 'name=Alon&tags%5B%5D=a&tags%5B%5D=b',
+            ),
+            $handler,
+        );
+
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame(['name' => 'Alon', 'tags' => ['a', 'b']], $seen);
+        self::assertSame('name=Alon&tags%5B%5D=a&tags%5B%5D=b', $raw);
+    }
+
+    /**
+     * A multipart body reaches the handler as fields plus uploads, from
+     * the same middleware every runtime's raw bytes arrive at.
+     */
+    public function test_a_multipart_body_becomes_fields_and_uploaded_files(): void
+    {
+        $body = "--B\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nAlon\r\n"
+            . "--B\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\n"
+            . "Content-Type: image/png\r\n\r\npng bytes\r\n--B--\r\n";
+
+        $parsed = null;
+        $files = null;
+        $handler = new CallableRequestHandler(function (ServerRequestInterface $request) use (&$parsed, &$files) {
+            $parsed = $request->getParsedBody();
+            $files = $request->getUploadedFiles();
+
+            return new Response(200);
+        });
+
+        $response = $this->middleware(10_000)->process(
+            new ServerRequest('POST', '/', headers: ['Content-Type' => 'multipart/form-data; boundary=B'], body: $body),
+            $handler,
+        );
+
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame(['name' => 'Alon'], $parsed);
+        self::assertArrayHasKey('avatar', $files);
+        self::assertSame('a.png', $files['avatar']->getClientFilename());
+        self::assertSame('png bytes', (string) $files['avatar']->getStream());
+    }
+
+    /**
+     * A multipart body the parser cannot read is the fixed `400` every
+     * runtime answers with — never the parser's own text, which is
+     * assembled from the input that failed.
+     */
+    public function test_an_unparseable_multipart_body_is_the_fixed_400(): void
+    {
+        $response = $this->middleware(10_000)->process(
+            new ServerRequest('POST', '/', headers: ['Content-Type' => 'multipart/form-data'], body: 'not multipart'),
+            $this->handler(),
+        );
+
+        self::assertSame(400, $response->getStatusCode());
+        self::assertSame(
+            ['error' => RuntimeAdapterInterface::MALFORMED_BODY_MESSAGE],
+            json_decode((string) $response->getBody(), true),
+        );
+    }
+
+    /**
+     * A form past a structural ceiling is a `413`, the same answer an
+     * oversized one gets, and the handler never runs.
+     */
+    public function test_a_form_past_a_structural_ceiling_is_413(): void
+    {
+        $calls = 0;
+        $handler = new CallableRequestHandler(function () use (&$calls) {
+            $calls++;
+
+            return new Response(200);
+        });
+
+        $pairs = [];
+
+        for ($i = 0; $i <= FormLimits::MAX_INPUT_VARS; $i++) {
+            $pairs[] = "f{$i}=1";
+        }
+
+        $response = $this->middleware(10_000_000)->process(
+            new ServerRequest(
+                'POST',
+                '/',
+                headers: ['Content-Type' => 'application/x-www-form-urlencoded'],
+                body: implode('&', $pairs),
+            ),
+            $handler,
+        );
+
+        self::assertSame(413, $response->getStatusCode());
+        self::assertSame(0, $calls);
+    }
+
+    /**
+     * A body that is not a form is staged and handed on untouched — no
+     * parsed body invented for it, and every byte still there.
+     */
+    public function test_a_raw_body_is_staged_without_being_parsed(): void
+    {
+        $binary = random_bytes(2_048);
+        $seen = null;
+        $parsed = 'unset';
+        $handler = new CallableRequestHandler(function (ServerRequestInterface $request) use (&$seen, &$parsed) {
+            $seen = (string) $request->getBody();
+            $parsed = $request->getParsedBody();
+
+            return new Response(200);
+        });
+
+        $response = $this->middleware(10_000)->process(
+            new ServerRequest('POST', '/', headers: ['Content-Type' => 'application/octet-stream'], body: $binary),
+            $handler,
+        );
+
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame($binary, $seen);
+        self::assertNull($parsed);
     }
 
     public function test_runs_unconditionally_as_global_middleware_right_after_the_exception_handler(): void
